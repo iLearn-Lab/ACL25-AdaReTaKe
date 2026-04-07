@@ -510,7 +510,15 @@ class StandardVidLangKVCache(VidLangKVCache):
         # self.rope_kwargs_list: List[Tuple] = []
         self.enable_temporal_adaptation = self.kv_compression_kwargs.get('enable_temporal_adaptation', False)
         if self.enable_temporal_adaptation:
-            self.temporal_adaptation_ratio = self.kv_compression_kwargs.get('temporal_adaptation_ratio', 10.0)
+            self._chunk_temporal_ratio = 1.0  # Pre-computed ratio from visual feature similarity
+
+    def set_temporal_adaptation_ratio(self, ratio):
+        """Set the pre-computed temporal adaptation ratio for the current chunk.
+
+        This ratio is computed before prefill from inter-frame cosine distance (AdaReTaKe Eq. 9).
+        Higher ratio means more diverse content → more tokens kept.
+        """
+        self._chunk_temporal_ratio = ratio
 
     def update_attn_cumscores(
         self,
@@ -658,8 +666,7 @@ class StandardVidLangKVCache(VidLangKVCache):
 
                 # comp_ratio_ori = compression_ratio
                 if self.enable_temporal_adaptation:
-                    ratio = torch.where(attn_cumscores > 0.01 * attn_cumscores.max())[0].shape[0] / attn_cumscores.shape[0]
-                    ratio = math.sqrt(self.temporal_adaptation_ratio * ratio)
+                    ratio = self._chunk_temporal_ratio  # Pre-computed from visual feature similarity (AdaReTaKe Eq. 9)
                     ratio = min(2, max(1/2, ratio))
                     compression_ratio = min(1, ratio * compression_ratio)
                 # print('global comp ratio: %.4f, layer comp_ratio: %.4f, chunk comp_ratio %.4f' % (self.compression_ratio, comp_ratio_ori, compression_ratio))

@@ -17,7 +17,6 @@ longvideo_kwargs: {
     'max_input_length': 16000,
     # Temporal
     'enable_temporal_adaptation': True,
-    'temporal_adaptation_ratio': 4,
     # Layer
     'budget_allocation_method': 'adakv',
   },

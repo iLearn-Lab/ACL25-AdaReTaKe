@@ -480,6 +480,79 @@ def retake_Qwen2_5_VLForConditionalGeneration_get_chunk_size(self, config, video
         # Avoid machine error in ceil() when calculating `num_chunks`.
     return chunk_prefill_size
 
+def compute_temporal_adaptation_ratios(config, inputs_embeds, modality_segments, video_grid_thw, chunk_size):
+    """计算每个 chunk 的时序自适应压缩比（AdaReTaKe Eq. 9）。
+
+    对每个 chunk 计算它与相邻 chunk 之间的平均 cosine distance，作为该 chunk 的多样性权重。
+    多样性越高（与邻居差异越大）→ 保留更多 token；多样性越低 → 保留更少。
+
+    计算方式：
+    1. 将视频 embedding reshape 为 (num_frames_merged, patches_per_frame, dim)，
+       然后对空间和时间维度取均值得到每个 chunk 一个 embedding 向量。
+    2. 对第 i 个 chunk，计算 d_i = mean(dist(chunk_i, chunk_{i-1}), dist(chunk_i, chunk_{i+1}))。
+       边界处理：pad 首尾 chunk embedding 各一份。
+    3. 归一化使所有 ratio 的均值为 1.0，保持整体压缩预算不变。
+
+    Returns:
+        chunk_compression_ratios: List[float] | None. 若不启用则返回 None。
+    """
+    if not (getattr(config, 'longvideo_kwargs', None) and
+            config.longvideo_kwargs.get('kvcache_compression', False) and
+            config.longvideo_kwargs['kvcache_compression_kwargs'].get('enable_temporal_adaptation', False)):
+        return None
+
+    for seg_id, (s, e, dtype) in enumerate(modality_segments):
+        if dtype != 'video':
+            continue
+
+        video_segment_embeds = inputs_embeds[0, s:e]  # [num_video_tokens, hidden_dim]
+
+        # Reshape 为 (num_frames_merged, patches_per_frame, hidden_dim)
+        grid_t, grid_h, grid_w = video_grid_thw[0]
+        t_factor = config.vision_config.spatial_merge_size ** 2 * config.vision_config.temporal_patch_size
+        num_frames_merged = int((grid_t * grid_h * grid_w / t_factor) // (grid_h * grid_w / t_factor))
+        patches_per_frame = int(grid_h * grid_w / t_factor)
+        frame_embeds = video_segment_embeds[:num_frames_merged * patches_per_frame].reshape(
+            num_frames_merged, patches_per_frame, -1
+        )  # [num_frames_merged, patches_per_frame, dim]
+
+        # 对空间维度取均值，得到每帧一个向量
+        frame_embeds = frame_embeds.mean(dim=1)  # [num_frames_merged, dim]
+
+        # 按 chunk 划分帧，对时间维度取均值得到每个 chunk 一个向量
+        num_video_tokens = e - s
+        num_chunks = math.ceil(num_video_tokens / chunk_size)
+        frames_per_chunk = num_frames_merged / num_chunks  # float，均匀分配
+
+        chunk_embeds = []
+        for idx in range(num_chunks):
+            fs = int(idx * frames_per_chunk)
+            fe = min(int((idx + 1) * frames_per_chunk), num_frames_merged)
+            chunk_embeds.append(frame_embeds[fs:fe].mean(dim=0))  # [dim]
+        chunk_embeds = torch.stack(chunk_embeds)  # [num_chunks, dim]
+
+        # 边界 padding：复制首尾 chunk embedding
+        padded = torch.cat([chunk_embeds[:1], chunk_embeds, chunk_embeds[-1:]], dim=0)  # [num_chunks+2, dim]
+
+        # 计算每个 chunk 与左右邻居的平均 cosine distance
+        # d_i = mean(1 - cos(chunk_i, chunk_{i-1}), 1 - cos(chunk_i, chunk_{i+1}))
+        center = padded[1:-1]   # [num_chunks, dim]
+        left   = padded[:-2]    # [num_chunks, dim]
+        right  = padded[2:]     # [num_chunks, dim]
+        dist_left  = 1 - F.cosine_similarity(center, left, dim=-1)   # [num_chunks]
+        dist_right = 1 - F.cosine_similarity(center, right, dim=-1)  # [num_chunks]
+        chunk_distances = ((dist_left + dist_right) / 2).tolist()
+
+        # 归一化：α_i = d̄_i / Σ d̄_k × num_chunks，使 mean(ratios) = 1.0
+        total_distance = sum(chunk_distances)
+        if total_distance > 0:
+            chunk_compression_ratios = [d / total_distance * num_chunks for d in chunk_distances]
+        else:
+            chunk_compression_ratios = [1.0] * num_chunks
+        return chunk_compression_ratios
+
+    return None  # 没有 video segment
+
 def retake_Qwen2_5_VLForConditionalGeneration_forge_input_chunks(self, ss, ee, modality_segments, cache_position, position_ids, attention_mask, past_key_values, inputs_embeds):
     cache_position_chunk = cache_position[ss:ee]
     position_ids_chunk = position_ids[:,:,ss:ee]
@@ -653,6 +726,12 @@ def retake_Qwen2_5_VLForConditionalGeneration_forward(
     if is_prefill and chunk_size is not None: # Chunked prefill stage
         assert past_key_values is not None
         kvcache_compression = getattr(past_key_values, 'kvcache_compression', False)
+
+        # Pre-compute per-chunk temporal adaptation ratios (AdaReTaKe Eq. 9)
+        chunk_compression_ratios = compute_temporal_adaptation_ratios(
+            self.config, inputs_embeds, modality_segments, video_grid_thw, chunk_size
+        )
+
         for seg_id, (s, e, dtype) in enumerate(modality_segments):
             if dtype == 'text': # Prefill text without kvcache_compression
                 past_key_values.kvcache_compression = False
@@ -682,6 +761,9 @@ def retake_Qwen2_5_VLForConditionalGeneration_forward(
                     )
                     if hasattr(past_key_values, 'before_forward'):
                         past_key_values.before_forward(prompt_length=prompt_length)
+                    # Pass pre-computed temporal adaptation ratio for this chunk
+                    if chunk_compression_ratios is not None and hasattr(past_key_values, 'set_temporal_adaptation_ratio'):
+                        past_key_values.set_temporal_adaptation_ratio(chunk_compression_ratios[idx])
                     outputs = self.model(
                         input_ids=None,
                         position_ids=position_ids_chunk,

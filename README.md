@@ -2,6 +2,16 @@
 [![Paper](https://img.shields.io/badge/arXiv-2503.12559-b31b1b.svg)](https://arxiv.org/abs/2503.12559)  
 *Breaking the "Memory Wall" for MLLMs with Adaptive Video Compression*
 
+## Authors
+
+**Xiao Wang**<sup>1,2,‡</sup>, **Qingyi Si**<sup>2,‡</sup>, **Jianlong Wu**<sup>1</sup>\*, **Shiyu Zhu**<sup>3</sup>, **Li Cao**<sup>2</sup>, **Liqiang Nie**<sup>1</sup>\*
+
+<sup>1</sup> `Harbin Institute of Technology, Shenzhen`  
+<sup>2</sup> `Huawei Technologies Co., Ltd.`  
+<sup>2</sup> `Shandong University`  
+‡ Equal contribution
+\* Corresponding authors
+
 <p align="center">
   <img src="misc/flexreduc_pipeline.png" alt="AdaReTaKe Framework" width="70%">
 </p>

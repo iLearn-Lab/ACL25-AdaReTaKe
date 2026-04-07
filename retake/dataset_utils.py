@@ -41,6 +41,8 @@ class BaseDataset:
         video_maxlen = kwargs.get("video_maxlen")
         extraction_fps = kwargs.get("video_frame_extraction_fps")
         total_frames = len(frame_files)
+        if total_frames == 0:
+            return 0, 0.0
         sample_frames = float(total_frames / extraction_fps) * video_fps
         sample_frames = min(total_frames, video_maxlen, sample_frames)
         sample_frames = math.floor(sample_frames)
@@ -72,7 +74,13 @@ class BaseDataset:
             os.path.join(video_root, file) for file in list(sorted(os.listdir(video_root)))
         ]
         total_frames = len(frame_files)
+        if total_frames == 0:
+            print(f"Warning: no frames found in {video_root}, skipping.")
+            return frames, 0.0
         sample_frames, sampling_fps = self._get_video_sample_extracted_frames(frame_files, **self.processor_kwargs)
+        if sample_frames == 0:
+            print(f"Warning: sample_frames=0 for {video_root}, skipping.")
+            return frames, 0.0
         sample_indices = np.linspace(0, total_frames - 1, sample_frames).astype(np.int32)
         for frame_idx, frame_file in enumerate(frame_files):
             if frame_idx in sample_indices:
@@ -90,6 +98,10 @@ class BaseDataset:
         frames, sampling_fps = self.get_video_message(anno["videos"][0])
         meta = anno["meta"]
         meta['answer'] = anno["messages"][1]["content"]
+
+        # 跳过空帧视频：返回 None，在推理循环中过滤
+        if len(frames) == 0:
+            return None
 
         messages = dict(
             question=question,

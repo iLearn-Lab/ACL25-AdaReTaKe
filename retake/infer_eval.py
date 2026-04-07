@@ -246,6 +246,8 @@ def main(rank, world_size, args):
     dataloader = DataLoader(shard_dataset, batch_size=None, num_workers=exp_configs['dataloader_num_workers'])
 
     for i, sample in tqdm(enumerate(dataloader), total=len(dataloader), desc=f'rank {rank}'): # disable=rank!=0
+        if sample is None:
+            continue
         i = i + start_sample_id
         idx, message, meta = sample
         pred_answer = client.infer(message)

@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 import pandas as pd
 from tqdm import tqdm
 from torch.utils.data import Dataset
@@ -22,7 +23,7 @@ def get_duration_span(row):
         raise ValueError
 
 
-if __name__ == "__main__":
+def main(args):
     video_root = os.path.join(args.hf_root, 'video_25fps')
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_qwen2vl7b_path)

@@ -6,6 +6,7 @@ import re
 import yaml
 import datetime
 import argparse
+import shutil
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Subset
 import torch
@@ -133,6 +134,32 @@ class InferClient:
         output_text = output_text[0]
 
         return output_text
+
+
+def save_config(output_dir, exp_configs, args, world_size):
+    """Save complete experiment configuration to output_dir for reproducibility."""
+    config_save_path = os.path.join(output_dir, "config.yaml")
+    full_config = {
+        **exp_configs,
+        'runtime_args': {
+            'model_name': args.model_name,
+            'hf_path': args.hf_path,
+            'config_path': args.config_path,
+            'video_frame_extraction_fps': args.video_frame_extraction_fps,
+            'n_gpus': args.n_gpus,
+            'auto_sharding': args.auto_sharding,
+            'enable_cache': args.enable_cache,
+            'skip_eval': args.skip_eval,
+            'timeout': args.timeout,
+        },
+        'execution_info': {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'world_size': world_size,
+        }
+    }
+    with open(config_save_path, 'w') as F:
+        yaml.dump(full_config, F, default_flow_style=False, sort_keys=False)
+    print(f"Configuration saved to: {config_save_path}")
 
 
 def parse_arguments():
@@ -286,6 +313,9 @@ def main(rank, world_size, args):
             json.dump(merged_anno_id2result, F)
         with open(meta_file, 'w') as F:
             json.dump(merged_anno_id2meta, F)
+        
+        # Save complete configuration for reproducibility
+        save_config(exp_configs['output_dir'], exp_configs, args, world_size)
 
         if not args.skip_eval:
             # Evaluate

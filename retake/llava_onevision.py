@@ -39,6 +39,13 @@ if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 else:
     flash_attn_varlen_func = None
+    # Fallback: define an empty TypedDict so Unpack[FlashAttentionKwargs] in signatures doesn't fail
+    try:
+        from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+    except ImportError:
+        from typing import TypedDict
+        class FlashAttentionKwargs(TypedDict, total=False):
+            pass
 
 DEBUG_MODE = False
 

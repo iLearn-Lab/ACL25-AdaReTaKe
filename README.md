@@ -1,5 +1,5 @@
-# 🌟 AdaReTaKe: Adaptive Redundancy Reduction for Long-Context Video-Language Understanding  
-[![Paper](https://img.shields.io/badge/arXiv-2503.12559-b31b1b.svg)](https://arxiv.org/abs/2503.12559)  
+# 🌟 AdaReTaKe: Adaptive Redundancy Reduction for Long-Context Video-Language Understanding
+[![Paper](https://img.shields.io/badge/arXiv-2503.12559-b31b1b.svg)](https://arxiv.org/abs/2503.12559)
 *Breaking the "Memory Wall" for MLLMs with Adaptive Video Compression*
 
 <p align="center">
@@ -48,8 +48,8 @@ pip install -r requirements.txt
 conda env create -f environment_npu.yaml
 
 # Additional dependencies
-pip install git+https://github.com/huggingface/transformers.git@f3f6c86582611976e72be054675e2bf0abb5f775
 apt-get install ffmpeg  # Required for full video processing
+pip install flash-attn==2.6.3 --no-build-isolation
 ```
 
 ---
@@ -90,7 +90,7 @@ python demo.py
 ### Evaluation Scripts  
 ```bash
 # Example for VideoMME (adjust for other datasets)
-bash scripts/infer_eval.sh ${Qwen2.5-VL-7B-PATH} configs/qwen2_5_vl/flexreduc_qwen2-5-vl_videomme.yaml 8
+bash scripts/infer_eval.sh ${Qwen2.5-VL-7B-PATH} configs/qwen2_5_vl/flexreduc_qwen2-5-vl_videomme.yaml 8 25
 ```
 *Results saved in `./results`*
 

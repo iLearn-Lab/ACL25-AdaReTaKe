@@ -12,6 +12,31 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Compatibility shim: transformers ≥ 4.57 redesigned DynamicCache completely.
+#   Old: DynamicCache.key_cache[i] / .value_cache[i]  (List[Tensor])
+#   New: DynamicCache.layers[i].keys / .layers[i].values  (List[CacheLayerMixin])
+#
+# We provide two tiny helpers so the rest of the file can be written once
+# and work with both API versions.
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_kv(cache: DynamicCache, layer_idx: int):
+    """Return (key_tensor, value_tensor) for layer_idx, API-agnostic."""
+    if hasattr(cache, 'layers'):          # transformers ≥ 4.57
+        return cache.layers[layer_idx].keys, cache.layers[layer_idx].values
+    else:                                  # transformers < 4.57
+        return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
+
+def _set_kv(cache: DynamicCache, layer_idx: int, key: torch.Tensor, value: torch.Tensor):
+    """Write (key_tensor, value_tensor) for layer_idx back into cache, API-agnostic."""
+    if hasattr(cache, 'layers'):          # transformers ≥ 4.57
+        cache.layers[layer_idx].keys   = key
+        cache.layers[layer_idx].values = value
+    else:                                  # transformers < 4.57
+        cache.key_cache[layer_idx]   = key
+        cache.value_cache[layer_idx] = value
+
+
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -95,10 +120,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1, rev
             Deprecated and unused.
         unsqueeze_dim (`int`, *optional*, defaults to 1):
             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            sin[position_ids] so that they can be properly broadcasted to the shapes of q and k. Similarly, if q and k have
             the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
@@ -233,7 +255,7 @@ class PivotKVCache(DynamicCache):
         logger.warning_once("Enable PivotKVCache compression: length after compression %.2f" % (self.compression_ratio))
 
         position_ids = cache_kwargs.pop('position_ids', None)
-        # 1) Hidden states for the next layer remains uncompressed in current chunked prefill iter
+        # 1) Append new KV to cache (full, uncompressed) for use by this layer's attention
         key_states_output, value_states_output = super().update(key_states, value_states, layer_idx, cache_kwargs)
 
         if self.kvcache_compression: # when prefilling visual tokens
@@ -249,7 +271,7 @@ class PivotKVCache(DynamicCache):
                 cos, sin = rotary_emb_fn(value_states, position_ids)
                 if mrope_section:
                     query_states, key_states = apply_multimodal_rotary_pos_emb(
-                        query_states, key_states, cos, sin, mrope_section, 
+                        query_states, key_states, cos, sin, mrope_section,
                         reverse=True, attention_scaling=rotary_emb_fn.attention_scaling
                     )
                 else:
@@ -308,13 +330,14 @@ class PivotKVCache(DynamicCache):
                 _ = self.update_position_ids(compressed_position_ids, layer_idx)
             _ = self.update_num_evicted_tokens(k_len - keep_len, layer_idx)
 
-            # 3) Update KVCache
-            self.key_cache[layer_idx] = torch.cat([
-                key_states_output[...,:-q_len,:], compressed_key_states
-            ], dim=2)
-            self.value_cache[layer_idx] = torch.cat([
-                value_states_output[...,:-q_len,:], compressed_value_states
-            ], dim=2)
+            # 3) Replace cached KV with the compressed version
+            #    key_states_output has shape [..., prev_tokens + q_len, ...]
+            #    We keep prev_tokens unchanged and replace the last q_len tokens with compressed ones.
+            _key_full, _val_full = _get_kv(self, layer_idx)
+            _set_kv(self, layer_idx,
+                torch.cat([_key_full[..., :-q_len, :], compressed_key_states], dim=-2),
+                torch.cat([_val_full[..., :-q_len, :], compressed_value_states], dim=-2),
+            )
         else: # when prefilling textual tokens / decoding / kvcache compression disabled
             if self.pos_embed_reforge:
                 _ = self.update_position_ids(position_ids, layer_idx)
@@ -331,12 +354,20 @@ class VidLangKVCache(PivotKVCache):
         assert self.prompt_guided_compression
         # For KV cache budget allocaation
         self.budget_allocation_method = self.kv_compression_kwargs.get('budget_allocation_method', 'even')
+        # Initialized to None; set by before_forward() during prefill, reset by after_forward()
+        self.prompt_length = None
+        self._chunk_position_ids = None
 
-    def before_forward(self, prompt_length, **kwargs):
+    def before_forward(self, prompt_length, position_ids=None, **kwargs):
         self.prompt_length = prompt_length
+        # In transformers >= 4.57, the text model pre-computes RoPE at the model level
+        # and passes position_ids=None to decoder layers.  We store the chunk's 3D
+        # position_ids here so update() can use it as a fallback when needed.
+        self._chunk_position_ids = position_ids
 
     def after_forward(self, **kwargs):
         self.prompt_length = None # Turned off by default
+        self._chunk_position_ids = None
 
     def compress_prompt(self, query_states, key_states_repeated, q_len, num_key_value_heads, head_dim):
         # Same with text raters in SparseVLMs
@@ -390,19 +421,32 @@ class VidLangKVCache(PivotKVCache):
         logger.warning_once("Enable VidLangKVCache compression: length after compression %.2f" % (self.compression_ratio))
 
         position_ids = cache_kwargs.pop('position_ids', None)
+        # In transformers >= 4.57, prepare_inputs_for_generation returns position_ids with shape
+        # [4, bs, seq_len] (text + 3 vision dimensions concatenated).  The Qwen2_5_VLTextModel
+        # then splits it: text_position_ids = position_ids[0]  (2D [bs, seq_len]) and passes
+        # that 2D slice to decoder layers.  The rotary_emb_fn for MRoPE expects 3D [3, bs, seq_len].
+        # Fix: if position_ids is 2D (text positions) or None, fall back to the full [4, bs, seq_len]
+        # stored before this forward call and extract the 3D vision positions [1:].
+        if (position_ids is None or (hasattr(position_ids, 'ndim') and position_ids.ndim == 2)) and self.prompt_length is not None:
+            stored_pids = getattr(self, '_chunk_position_ids', None)
+            if stored_pids is not None:
+                # If [4, bs, seq_len], take [1:] to get [3, bs, seq_len] (vision positions)
+                position_ids = stored_pids[1:] if stored_pids.ndim == 3 and stored_pids.shape[0] == 4 else stored_pids
         compression_ratio = self.budget_allocation(layer_idx)
-        # print('compression_ratio of layer %d: %.4f' % (layer_idx, compression_ratio))
 
-        if self.kvcache_compression and self.compression_ratio < 1.0 and compression_ratio == 1.0:
+        if self.kvcache_compression and self.compression_ratio < 1.0 and compression_ratio == 1.0 and self.prompt_length is not None:
             # Truncate the prompts directly when no compression
             key_states = key_states[:,:,:-self.prompt_length]
             value_states = value_states[:,:,:-self.prompt_length]
             position_ids = position_ids[...,:-self.prompt_length]
 
-        # 1) Hidden states for the next layer remains uncompressed in current chunked prefill iter
+        # 1) Append new KV to cache (full, uncompressed) for use by this layer's attention
+        # NOTE: call DynamicCache.update directly, skip PivotKVCache
         key_states_output, value_states_output = super(PivotKVCache, self).update(key_states, value_states, layer_idx, cache_kwargs)
 
-        if self.kvcache_compression and compression_ratio < 1.0: # when compression is enabled
+        # Guard: only compress during prefill (prompt_length is set by before_forward, reset to None by after_forward).
+        # During decode, prompt_length is None and compression should be skipped.
+        if self.kvcache_compression and compression_ratio < 1.0 and self.prompt_length is not None: # when compression is enabled
             query_states = cache_kwargs.pop('query_states')
             rotary_emb_fn = cache_kwargs.pop('rotary_emb')
             mrope_section = cache_kwargs.pop('mrope_section', None)
@@ -410,7 +454,7 @@ class VidLangKVCache(PivotKVCache):
                 cos, sin = rotary_emb_fn(value_states, position_ids)
                 if mrope_section:
                     query_states, key_states = apply_multimodal_rotary_pos_emb(
-                        query_states, key_states, cos, sin, mrope_section, 
+                        query_states, key_states, cos, sin, mrope_section,
                         reverse=True, attention_scaling=rotary_emb_fn.attention_scaling
                     )
                 else:
@@ -434,7 +478,6 @@ class VidLangKVCache(PivotKVCache):
             if self.prompt_compression:
                 query_states = self.compress_prompt(query_states, key_states_repeated, q_len, num_key_value_heads, head_dim)
                 q_len = query_states.shape[2]
-                # [bsz, self.num_heads, q_len', head_dim]
 
             keep_len = max(1, int(compression_ratio * k_len)) # Evict new tokens only
             attn_weights = torch.matmul(query_states, key_states_repeated.transpose(2, 3)) / math.sqrt(head_dim)
@@ -444,7 +487,6 @@ class VidLangKVCache(PivotKVCache):
             attn_weights = attn_weights[0].sum(1) # [self.num_heads, k_len]
             attn_weights = attn_weights.reshape(num_key_value_heads, -1, k_len).mean(1) # [num_key_value_heads, k_len]
             attn_weights = attn_weights.mean(0) # [k_len]
-            # attn_weights = attn_weights.max(0).values # [k_len]
 
             _, keep_indices = attn_weights.topk(keep_len)
             keep_indices = keep_indices.sort().values # [keep_len]
@@ -462,13 +504,6 @@ class VidLangKVCache(PivotKVCache):
 
             if self.pos_embed_reforge:
                 assert bsz == 1
-
-                # # NOTE: type 1
-                # # Get the unique elements and their corresponding re-indexed values
-                # new_temporal_index = torch.unique(compressed_position_ids[0], return_inverse=True)[1]
-                # compressed_position_ids[0] = self.get_prev_temporal_idx(layer_idx) + 1 + new_temporal_index
-
-                # NOTE: type 2
                 min_temp_id = compressed_position_ids[0].min()
                 comp_ratio = keep_len / k_len # NOTE: avoid truncating issues when calculating keep_len
                 compressed_position_ids[0] = min_temp_id + ((compressed_position_ids[0] - min_temp_id) * comp_ratio).long()
@@ -487,14 +522,19 @@ class VidLangKVCache(PivotKVCache):
             _ = self.update_position_ids(compressed_position_ids, layer_idx)
             _ = self.update_num_evicted_tokens(k_len - keep_len, layer_idx)
 
-            # 3) Update KVCache
-            self.key_cache[layer_idx] = torch.cat([
-                key_states_output[...,:-ori_cache_len,:], compressed_key_states
-            ], dim=2)
-            self.value_cache[layer_idx] = torch.cat([
-                value_states_output[...,:-ori_cache_len,:], compressed_value_states
-            ], dim=2)
+            # 3) Replace cached KV with compressed version
+            #    ori_cache_len = prompt_len + k_len = total tokens appended this chunk
+            _key_full, _val_full = _get_kv(self, layer_idx)
+            _set_kv(self, layer_idx,
+                torch.cat([_key_full[..., :-ori_cache_len, :], compressed_key_states], dim=-2),
+                torch.cat([_val_full[..., :-ori_cache_len, :], compressed_value_states], dim=-2),
+            )
         else: # when prefilling textual tokens or decoding / kvcache compression disabled
+            # In transformers >= 4.57, the text model splits position_ids and passes a 2D
+            # text_position_ids to decoder layers.  Expand to 3D so that position_cache stays
+            # consistent with the 3D tensors written during video chunk prefill.
+            if position_ids is not None and position_ids.ndim == 2:
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
             _ = self.update_position_ids(position_ids, layer_idx)
 
         return key_states_output, value_states_output
@@ -506,9 +546,7 @@ class StandardVidLangKVCache(VidLangKVCache):
     """
     def __init__(self, config) -> None:
         super().__init__(config)
-        self.attn_cumscores_cache: List[torch.Tensor] = []
-        # self.rope_kwargs_list: List[Tuple] = []
-        self.enable_temporal_adaptation = self.kv_compression_kwargs.get('enable_temporal_adaptation', False)
+        self.attn_cumscores_cache = []  # Accumulates per-layer attn scores during prefill; cleared by after_forward()
         self._base_compression_ratio = self.compression_ratio  # Save original ratio for reset between chunks
 
     def set_temporal_adaptation_ratio(self, ratio):
@@ -545,10 +583,25 @@ class StandardVidLangKVCache(VidLangKVCache):
         logger.warning_once("Enable StandardVidLangKVCache compression: length after compression %.2f" % (self.compression_ratio))
 
         position_ids = cache_kwargs.pop('position_ids', None)
-        # 1) Hidden states for the next layer remains uncompressed in current chunked prefill iter
+        # In transformers >= 4.57, prepare_inputs_for_generation returns position_ids with shape
+        # [4, bs, seq_len] (text + 3 vision dimensions concatenated).  The Qwen2_5_VLTextModel
+        # then splits it: text_position_ids = position_ids[0]  (2D [bs, seq_len]) and passes
+        # that 2D slice to decoder layers.  The rotary_emb_fn for MRoPE expects 3D [3, bs, seq_len].
+        # Fix: if position_ids is 2D (text positions), fall back to the full [4, bs, seq_len]
+        # stored before this forward call and extract the 3D vision positions [1:].
+        if (position_ids is None or (hasattr(position_ids, 'ndim') and position_ids.ndim == 2)) and self.prompt_length is not None:
+            stored_pids = getattr(self, '_chunk_position_ids', None)
+            if stored_pids is not None:
+                # If [4, bs, seq_len], take [1:] to get [3, bs, seq_len] (vision positions)
+                position_ids = stored_pids[1:] if stored_pids.ndim == 3 and stored_pids.shape[0] == 4 else stored_pids
+
+        # 1) Append new KV to cache (full, uncompressed) for use by this layer's attention
+        # NOTE: call DynamicCache.update directly, skip PivotKVCache
         key_states_output, value_states_output = super(PivotKVCache, self).update(key_states, value_states, layer_idx, cache_kwargs)
 
-        if self.kvcache_compression and self.compression_ratio < 1.0: # when kvcache compression is enabled
+        # Guard: only compress during prefill (prompt_length is set by before_forward, reset to None by after_forward).
+        # During decode, prompt_length is None and compression should be skipped.
+        if self.kvcache_compression and self.compression_ratio < 1.0 and self.prompt_length is not None: # when kvcache compression is enabled
             query_states = cache_kwargs.pop('query_states')
             rotary_emb_fn = cache_kwargs.pop('rotary_emb')
             mrope_section = cache_kwargs.pop('mrope_section', None)
@@ -556,7 +609,7 @@ class StandardVidLangKVCache(VidLangKVCache):
                 cos, sin = rotary_emb_fn(value_states, position_ids)
                 if mrope_section:
                     query_states, key_states = apply_multimodal_rotary_pos_emb(
-                        query_states, key_states, cos, sin, mrope_section, 
+                        query_states, key_states, cos, sin, mrope_section,
                         reverse=True, attention_scaling=rotary_emb_fn.attention_scaling
                     )
                 else:
@@ -582,7 +635,7 @@ class StandardVidLangKVCache(VidLangKVCache):
 
             key_states_repeated = repeat_kv(key_states, num_heads // num_key_value_heads)
 
-            # 2) Evit KV Cache based on query_states
+            # 2) Compute attention scores for token importance ranking
             attn_weights = torch.matmul(query_states, key_states_repeated.transpose(2, 3)) / math.sqrt(head_dim)
             attn_scores = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
                 query_states.dtype
@@ -590,11 +643,9 @@ class StandardVidLangKVCache(VidLangKVCache):
             attn_cumscores = attn_scores[0].sum(1) # [self.num_heads, k_len]
             attn_cumscores = attn_cumscores.reshape(num_key_value_heads, -1, k_len).mean(1) # [num_key_value_heads, k_len]
             attn_cumscores = attn_cumscores.mean(0) # [k_len]
-            # attn_cumscores = attn_cumscores.max(0).values # [k_len]
 
-            # 3) Send to list
+            # 3) Optionally re-apply rotary embedding with reforged positions
             if self.pos_embed_reforge:
-                # Add new rotary embedding
                 cos, sin = rotary_emb_fn(value_states, position_ids_key)
                 if mrope_section:
                     _, key_states = apply_multimodal_rotary_pos_emb(
@@ -606,20 +657,34 @@ class StandardVidLangKVCache(VidLangKVCache):
                     )
 
             self.update_attn_cumscores(attn_cumscores, layer_idx)
-            # self.rope_kwargs_list.append((rotary_emb_fn, mrope_section))
 
-            self.key_cache[layer_idx] = torch.cat([
-                key_states_output[...,:-ori_cache_len,:], key_states
-            ], dim=2)
-            self.value_cache[layer_idx] = torch.cat([
-                value_states_output[...,:-ori_cache_len,:], value_states
-            ], dim=2)
-            self.position_cache[layer_idx] = torch.cat([
-                self.position_cache[layer_idx], position_ids_key
-            ], dim=-1)
+            # 4) Replace the appended chunk in the cache with the (uncompressed-for-now) version
+            #    Actual top-k eviction happens in after_forward() after all layers are done.
+            #    ori_cache_len = prompt_len + k_len
+            _key_full, _val_full = _get_kv(self, layer_idx)
+            _set_kv(self, layer_idx,
+                torch.cat([_key_full[..., :-ori_cache_len, :], key_states], dim=-2),
+                torch.cat([_val_full[..., :-ori_cache_len, :], value_states], dim=-2),
+            )
+            # Also init / extend position_cache for this layer
+            if len(self.position_cache) <= layer_idx:
+                for _ in range(len(self.position_cache), layer_idx):
+                    self.position_cache.append([])
+                self.position_cache.append(position_ids_key)
+            elif len(self.position_cache[layer_idx]) == 0:
+                self.position_cache[layer_idx] = position_ids_key
+            else:
+                self.position_cache[layer_idx] = torch.cat(
+                    [self.position_cache[layer_idx], position_ids_key], dim=-1
+                )
         else: # when prefilling textual tokens or decoding / kvcache compression disabled
             assert getattr(self, 'prompt_length', None) is None
-            # Make sure text chunks are kept
+            # In transformers >= 4.57, the text model splits position_ids and passes a 2D
+            # text_position_ids to decoder layers.  Expand to 3D so that position_cache stays
+            # consistent with the 3D tensors written during video chunk prefill.
+            if position_ids is not None and position_ids.ndim == 2:
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+            # Make sure text chunks are kept (assign high score so they are never evicted)
             attn_cumscores = 1000. * torch.ones_like(position_ids)
             attn_cumscores = attn_cumscores[0, 0, :] if attn_cumscores.ndim == 3 else attn_cumscores[0, :]
             self.update_attn_cumscores(attn_cumscores, layer_idx)
@@ -654,53 +719,46 @@ class StandardVidLangKVCache(VidLangKVCache):
     def after_forward(self, **kwargs):
         if self.kvcache_compression and self.compression_ratio < 1.0: # when compression is enabled
             compression_ratio_layers = self.budget_allocation()
-            # print("AdaVidLangKVCache.after_forward(): compression_ratio_layers", compression_ratio_layers)
 
             bsz = 1
             for layer_idx, compression_ratio in enumerate(compression_ratio_layers):
                 attn_cumscores = self.attn_cumscores_cache[layer_idx]
                 k_len = attn_cumscores.shape[0]
-                key_states = self.key_cache[layer_idx][:,:,-k_len:]
-                value_states = self.value_cache[layer_idx][:,:,-k_len:]
-                position_ids_key = self.position_cache[layer_idx][...,-k_len:]
-                # rotary_emb_fn, mrope_section = self.rope_kwargs_list[layer_idx]
+                _key_full, _val_full = _get_kv(self, layer_idx)
+                key_states   = _key_full[..., -k_len:, :]
+                value_states = _val_full[..., -k_len:, :]
+                position_ids_key = self.position_cache[layer_idx][..., -k_len:]
 
-                # comp_ratio_ori = compression_ratio
-                if self.enable_temporal_adaptation:
-                    ratio = self._chunk_temporal_ratio  # Pre-computed from visual feature similarity (AdaReTaKe Eq. 9)
-                    ratio = min(2, max(1/2, ratio))
-                    compression_ratio = min(1, ratio * compression_ratio)
-                # print('global comp ratio: %.4f, layer comp_ratio: %.4f, chunk comp_ratio %.4f' % (self.compression_ratio, comp_ratio_ori, compression_ratio))
-                keep_len = max(1, int(max(0.01, compression_ratio) * k_len)) # Evict new tokens only
-                # if keep_len == 1:
-                #     # print("AdaVidLangKVCache.after_forward(): Got ill compression_ratio! compression_ratio_layers", compression_ratio_layers)
-                #     print("AdaVidLangKVCache.after_forward(): Got ill compression_ratio!")
+                # Apply temporal adaptation ratio (AdaReTaKe Eq. 9)
+                # _chunk_temporal_ratio already contains the absolute compression ratio
+                # (base_ratio * d_i / mean_d, clamped to [0, 1]), computed before prefill
+                # from visual feature similarity in compute_temporal_adaptation_ratios()
+
+                keep_len = max(1, int(max(0.01, compression_ratio) * k_len))
                 _, keep_indices = attn_cumscores.topk(keep_len)
                 keep_indices = keep_indices.sort().values # [keep_len]
-                keep_indices_kv = keep_indices[None,None,:,None].repeat(bsz, self.num_key_value_heads, 1, self.head_dim) # [bsz, num_key_value_heads, keep_len, head_dim]
-                compressed_key_states = torch.gather(input=key_states, dim=2, index=keep_indices_kv)
-                compressed_value_states = torch.gather(input=value_states, dim=2, index=keep_indices_kv) # [bsz, num_k_heads, keep_len, head_dim]
+                keep_indices_kv = keep_indices[None,None,:,None].repeat(bsz, self.num_key_value_heads, 1, self.head_dim)
+                compressed_key_states   = torch.gather(input=key_states,   dim=2, index=keep_indices_kv)
+                compressed_value_states = torch.gather(input=value_states, dim=2, index=keep_indices_kv)
 
-                # Calculate new postional ids
+                # Calculate new positional ids
                 if position_ids_key.ndim == 3:
-                    keep_indices_ids = keep_indices[None,None,:].repeat(3, bsz, 1) # [3, bsz, keep_len]
-                    compressed_position_ids = torch.gather(input=position_ids_key, dim=2, index=keep_indices_ids) # [3, bsz, keep_len]
+                    keep_indices_ids = keep_indices[None,None,:].repeat(3, bsz, 1)
+                    compressed_position_ids = torch.gather(input=position_ids_key, dim=2, index=keep_indices_ids)
                 else:
-                    keep_indices_ids = keep_indices[None,:].repeat(bsz, 1) # [bsz, keep_len]
-                    compressed_position_ids = torch.gather(input=position_ids_key, dim=1, index=keep_indices_ids) # [bsz, keep_len]
+                    keep_indices_ids = keep_indices[None,:].repeat(bsz, 1)
+                    compressed_position_ids = torch.gather(input=position_ids_key, dim=1, index=keep_indices_ids)
 
                 _ = self.update_num_evicted_tokens(k_len - keep_len, layer_idx)
 
-                # 4) Update KVCache
-                self.key_cache[layer_idx] = torch.cat([
-                    self.key_cache[layer_idx][:,:,:-k_len], compressed_key_states
-                ], dim=2)
-                self.value_cache[layer_idx] = torch.cat([
-                    self.value_cache[layer_idx][:,:,:-k_len], compressed_value_states
-                ], dim=2)
-                self.position_cache[layer_idx] = torch.cat([
-                    self.position_cache[layer_idx][...,:-k_len], compressed_position_ids
-                ], dim=-1)
+                # 4) Write compressed KV back, keeping all previous (already-compressed) tokens
+                _set_kv(self, layer_idx,
+                    torch.cat([_key_full[..., :-k_len, :], compressed_key_states], dim=-2),
+                    torch.cat([_val_full[..., :-k_len, :], compressed_value_states], dim=-2),
+                )
+                self.position_cache[layer_idx] = torch.cat(
+                    [self.position_cache[layer_idx][..., :-k_len], compressed_position_ids], dim=-1
+                )
 
         self.prompt_length = None # Turned off by default
         self.attn_cumscores_cache.clear()

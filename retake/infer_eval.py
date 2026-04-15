@@ -67,7 +67,7 @@ class InferClient:
             model = Qwen2VLForConditionalGeneration.from_pretrained(
                 hf_model_path,
                 config=qwen2vl_config,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 attn_implementation=exp_configs.get('attn_implementation', None),
                 device_map=device # "auto"
             ).eval()
@@ -81,7 +81,7 @@ class InferClient:
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 hf_model_path,
                 config=qwen2_5_vl_config,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 attn_implementation=exp_configs.get('attn_implementation', None),
                 device_map=device # "auto"
             ).eval()
@@ -96,7 +96,7 @@ class InferClient:
             model = LlavaOnevisionForConditionalGeneration.from_pretrained(
                 hf_model_path, 
                 config=llava_onevision_config,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 attn_implementation=exp_configs.get('attn_implementation', None),
                 device_map=device # "auto"
             ) 
@@ -247,7 +247,7 @@ def find_start_sample_id(rank, cache_dir):
     filenames = os.listdir(cache_dir)
     processed_sample_ids = [-1]
     for filename in filenames:
-        sample_id = re.findall(f'anno_id2result_{rank}_(\d+).pkl', filename)
+        sample_id = re.findall(rf'anno_id2result_{rank}_(\d+)\.pkl', filename)
         if len(sample_id):
             processed_sample_ids.append(int(sample_id[0]))
     start_sample_id = max(processed_sample_ids) + 1
@@ -259,7 +259,8 @@ def main(rank, world_size, args):
         device = 'auto'
     else:
         device = f'cuda:{rank}'
-        data_parallel_setup(rank, world_size, args.timeout)
+        if world_size > 1:
+            data_parallel_setup(rank, world_size, args.timeout)
 
     exp_configs = load_yaml(args.config_path)
 
@@ -365,7 +366,7 @@ def main(rank, world_size, args):
             infer_result_df.to_csv(infer_res_file, index=False)
             eval_result_df.to_csv(eval_res_file, index=True)
 
-    if not args.auto_sharding:
+    if not args.auto_sharding and world_size > 1:
         cleanup_parallel_setup()
 
 
@@ -373,6 +374,9 @@ if __name__ == "__main__":
     args = parse_arguments()
     world_size = args.n_gpus
     if args.auto_sharding: # For auto model parallel through huggingface
+        main(0, 1, args)
+    elif world_size == 1:
+        # 单卡直接在主进程跑，不走 mp.spawn，方便暴露 SIGFPE 的完整堆栈
         main(0, 1, args)
     else: # For data parallel
         mp.spawn(main, args=(world_size, args), nprocs=world_size, join=True)

@@ -509,8 +509,7 @@ class StandardVidLangKVCache(VidLangKVCache):
         self.attn_cumscores_cache: List[torch.Tensor] = []
         # self.rope_kwargs_list: List[Tuple] = []
         self.enable_temporal_adaptation = self.kv_compression_kwargs.get('enable_temporal_adaptation', False)
-        if self.enable_temporal_adaptation:
-            self._chunk_temporal_ratio = 1.0  # Pre-computed ratio from visual feature similarity
+        self._base_compression_ratio = self.compression_ratio  # Save original ratio for reset between chunks
 
     def set_temporal_adaptation_ratio(self, ratio):
         """Set the pre-computed temporal adaptation ratio for the current chunk.
@@ -518,7 +517,7 @@ class StandardVidLangKVCache(VidLangKVCache):
         This ratio is computed before prefill from inter-frame cosine distance (AdaReTaKe Eq. 9).
         Higher ratio means more diverse content → more tokens kept.
         """
-        self._chunk_temporal_ratio = ratio
+        self.compression_ratio = ratio
 
     def update_attn_cumscores(
         self,
@@ -568,7 +567,9 @@ class StandardVidLangKVCache(VidLangKVCache):
                 # NOTE: clone to avoid in-place ops, since latter layers will use it
                 position_ids = position_ids.clone()
                 min_temp_id = position_ids[0].min()
-                position_ids[0] = min_temp_id + ((position_ids[0] - min_temp_id) * self.compression_ratio).long()
+                # 使用基准 compression_ratio，不受 temporal adaptation 的 per-chunk ratio 影响
+                # 避免不同 chunk 被不同比例缩放导致跨 chunk 位置不一致
+                position_ids[0] = min_temp_id + ((position_ids[0] - min_temp_id) * self._base_compression_ratio).long()
             query_states = query_states[:,:,-self.prompt_length:]
             key_states = key_states[:,:,:-self.prompt_length]
             value_states = value_states[:,:,:-self.prompt_length]
@@ -703,7 +704,7 @@ class StandardVidLangKVCache(VidLangKVCache):
 
         self.prompt_length = None # Turned off by default
         self.attn_cumscores_cache.clear()
-        # self.rope_kwargs_list.clear()
+        self.compression_ratio = self._base_compression_ratio  # Reset to base ratio for next chunk
 
 
 def build_kvcache(config):

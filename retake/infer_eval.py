@@ -136,22 +136,52 @@ class InferClient:
         return output_text
 
 
-def save_config(output_dir, exp_configs, args, world_size):
+def gather_results(anno_id2result, anno_id2meta, rank, world_size, output_dir, auto_sharding=False, timeout=30):
+    """Gather results from all distributed processes via temp files.
+    
+    Returns lists of per-rank result/meta dicts that can be merged by rank 0.
+    """
+    import time
+
+    if auto_sharding:
+        return [anno_id2result], [anno_id2meta]
+
+    # Write per-rank results to temp files, then rank 0 merges them
+    gather_dir = os.path.join(output_dir, '_gather_tmp')
+    os.makedirs(gather_dir, exist_ok=True)
+    pickle.dump(anno_id2result, open(os.path.join(gather_dir, f'anno_id2result_{rank}.pkl'), 'wb'))
+    pickle.dump(anno_id2meta, open(os.path.join(gather_dir, f'anno_id2meta_{rank}.pkl'), 'wb'))
+    # Synchronize with a lightweight barrier; fall back gracefully if NCCL is unhealthy
+    try:
+        dist.barrier()
+    except Exception as e:
+        print(f'[rank {rank}] dist.barrier() failed ({e}), using file-poll fallback.')
+        deadline = time.time() + timeout * 60
+        while time.time() < deadline:
+            ready = all(
+                os.path.exists(os.path.join(gather_dir, f'anno_id2result_{r}.pkl'))
+                for r in range(world_size)
+            )
+            if ready:
+                break
+            time.sleep(5)
+    all_anno_id2result = [
+        pickle.load(open(os.path.join(gather_dir, f'anno_id2result_{r}.pkl'), 'rb'))
+        for r in range(world_size)
+    ]
+    all_anno_id2meta = [
+        pickle.load(open(os.path.join(gather_dir, f'anno_id2meta_{r}.pkl'), 'rb'))
+        for r in range(world_size)
+    ]
+    return all_anno_id2result, all_anno_id2meta
+
+
+def save_config(output_dir, exp_configs, runtime_args, world_size):
     """Save complete experiment configuration to output_dir for reproducibility."""
     config_save_path = os.path.join(output_dir, "config.yaml")
     full_config = {
         **exp_configs,
-        'runtime_args': {
-            'model_name': args.model_name,
-            'hf_path': args.hf_path,
-            'config_path': args.config_path,
-            'video_frame_extraction_fps': args.video_frame_extraction_fps,
-            'n_gpus': args.n_gpus,
-            'auto_sharding': args.auto_sharding,
-            'enable_cache': args.enable_cache,
-            'skip_eval': args.skip_eval,
-            'timeout': args.timeout,
-        },
+        'runtime_args': runtime_args,
         'execution_info': {
             'timestamp': datetime.datetime.now().isoformat(),
             'world_size': world_size,
@@ -289,15 +319,10 @@ def main(rank, world_size, args):
             pickle.dump(anno_id2result, open(anno_id2result_cachefile, 'wb'))
             pickle.dump(anno_id2meta, open(anno_id2meta_cachefile, 'wb'))
 
-    if not args.auto_sharding: # Gather results from all processes
-        all_anno_id2result = [None] * world_size
-        all_anno_id2meta = [None] * world_size
-        dist.barrier()
-        dist.all_gather_object(all_anno_id2result, anno_id2result)
-        dist.all_gather_object(all_anno_id2meta, anno_id2meta)
-    else:
-        all_anno_id2result = [anno_id2result]
-        all_anno_id2meta = [anno_id2meta]
+    all_anno_id2result, all_anno_id2meta = gather_results(
+        anno_id2result, anno_id2meta, rank, world_size,
+        exp_configs['output_dir'], auto_sharding=args.auto_sharding, timeout=args.timeout
+    )
 
     if rank == 0:
         # Merge results
@@ -315,7 +340,18 @@ def main(rank, world_size, args):
             json.dump(merged_anno_id2meta, F)
         
         # Save complete configuration for reproducibility
-        save_config(exp_configs['output_dir'], exp_configs, args, world_size)
+        runtime_args = {
+            'model_name': args.model_name,
+            'hf_path': args.hf_path,
+            'config_path': args.config_path,
+            'video_frame_extraction_fps': args.video_frame_extraction_fps,
+            'n_gpus': args.n_gpus,
+            'auto_sharding': args.auto_sharding,
+            'enable_cache': args.enable_cache,
+            'skip_eval': args.skip_eval,
+            'timeout': args.timeout,
+        }
+        save_config(exp_configs['output_dir'], exp_configs, runtime_args, world_size)
 
         if not args.skip_eval:
             # Evaluate

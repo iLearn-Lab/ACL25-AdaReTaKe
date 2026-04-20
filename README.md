@@ -1,6 +1,18 @@
 # 🌟 AdaReTaKe: Adaptive Redundancy Reduction for Long-Context Video-Language Understanding
 [![Paper](https://img.shields.io/badge/arXiv-2503.12559-b31b1b.svg)](https://arxiv.org/abs/2503.12559)
-*Breaking the "Memory Wall" for MLLMs with Adaptive Video Compression*
+*Breaking the "Memory Wall" for MLLMs with Adaptive Video Compression (ACL 2025)*
+
+---
+
+## Authors
+
+**Xiao Wang**<sup>1,2,‡</sup>, **Qingyi Si**<sup>2,‡</sup>, **Jianlong Wu**<sup>1</sup>\*, **Shiyu Zhu**<sup>3</sup>, **Li Cao**<sup>2</sup>, **Liqiang Nie**<sup>1</sup>\*
+
+<sup>1</sup> `Harbin Institute of Technology, Shenzhen`  
+<sup>2</sup> `Huawei Technologies Co., Ltd.`  
+<sup>2</sup> `Shandong University`  
+‡ Equal contribution
+\* Corresponding authors
 
 ---
 
@@ -14,10 +26,6 @@ Read AGENTS.md and reproduce the AdaReTaKe paper results end-to-end.
 
 [`AGENTS.md`](AGENTS.md) contains everything the agent needs: environment setup, dataset preparation, eval commands, expected scores, and common failure modes.
 
-<p align="center">
-  <img src="misc/flexreduc_pipeline.png" alt="AdaReTaKe Framework" width="70%">
-</p>
-
 ---
 
 ## 🔍 Overview  
@@ -25,6 +33,10 @@ Read AGENTS.md and reproduce the AdaReTaKe paper results end-to-end.
 ✅ **Extends context capacity** from 256 to **2048 frames**  
 ✅ **Theoretically minimizes compression loss** via adaptive ratio allocation  
 ✅ **Outperforms SOTA** by **+2.3% (7B)** and **+2.8% (72B)** on four benchmarks  
+
+<p align="center">
+  <img src="misc/flexreduc_pipeline.png" alt="AdaReTaKe Framework" width="70%">
+</p>
 
 ---
 

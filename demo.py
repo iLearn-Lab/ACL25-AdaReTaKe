@@ -148,7 +148,7 @@ def load_and_patch_model(model_name, hf_model_path, exp_configs, device):
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             hf_model_path,
             config=qwen2vl_config,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_implementation=exp_configs.get('attn_implementation', None),
             device_map=device # "auto"
         ).eval()
@@ -163,7 +163,7 @@ def load_and_patch_model(model_name, hf_model_path, exp_configs, device):
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             hf_model_path,
             config=qwen2_5_vl_config,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_implementation=exp_configs.get('attn_implementation', None),
             device_map=device # "auto"
         ).eval()
@@ -179,7 +179,7 @@ def load_and_patch_model(model_name, hf_model_path, exp_configs, device):
         model = LlavaOnevisionForConditionalGeneration.from_pretrained(
             hf_model_path, 
             config=llava_onevision_config,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_implementation=exp_configs.get('attn_implementation', None),
             device_map=device # "auto"
         ) 

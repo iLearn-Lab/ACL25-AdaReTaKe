@@ -6,6 +6,7 @@ import re
 import yaml
 import datetime
 import argparse
+import shutil
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Subset
 import torch
@@ -66,7 +67,7 @@ class InferClient:
             model = Qwen2VLForConditionalGeneration.from_pretrained(
                 hf_model_path,
                 config=qwen2vl_config,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 attn_implementation=exp_configs.get('attn_implementation', None),
                 device_map=device # "auto"
             ).eval()
@@ -80,7 +81,7 @@ class InferClient:
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 hf_model_path,
                 config=qwen2_5_vl_config,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 attn_implementation=exp_configs.get('attn_implementation', None),
                 device_map=device # "auto"
             ).eval()
@@ -95,7 +96,7 @@ class InferClient:
             model = LlavaOnevisionForConditionalGeneration.from_pretrained(
                 hf_model_path, 
                 config=llava_onevision_config,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 attn_implementation=exp_configs.get('attn_implementation', None),
                 device_map=device # "auto"
             ) 
@@ -133,6 +134,62 @@ class InferClient:
         output_text = output_text[0]
 
         return output_text
+
+
+def gather_results(anno_id2result, anno_id2meta, rank, world_size, output_dir, auto_sharding=False, timeout=30):
+    """Gather results from all distributed processes via temp files.
+    
+    Returns lists of per-rank result/meta dicts that can be merged by rank 0.
+    """
+    import time
+
+    if auto_sharding:
+        return [anno_id2result], [anno_id2meta]
+
+    # Write per-rank results to temp files, then rank 0 merges them
+    gather_dir = os.path.join(output_dir, '_gather_tmp')
+    os.makedirs(gather_dir, exist_ok=True)
+    pickle.dump(anno_id2result, open(os.path.join(gather_dir, f'anno_id2result_{rank}.pkl'), 'wb'))
+    pickle.dump(anno_id2meta, open(os.path.join(gather_dir, f'anno_id2meta_{rank}.pkl'), 'wb'))
+    # Synchronize with a lightweight barrier; fall back gracefully if NCCL is unhealthy
+    try:
+        dist.barrier()
+    except Exception as e:
+        print(f'[rank {rank}] dist.barrier() failed ({e}), using file-poll fallback.')
+        deadline = time.time() + timeout * 60
+        while time.time() < deadline:
+            ready = all(
+                os.path.exists(os.path.join(gather_dir, f'anno_id2result_{r}.pkl'))
+                for r in range(world_size)
+            )
+            if ready:
+                break
+            time.sleep(5)
+    all_anno_id2result = [
+        pickle.load(open(os.path.join(gather_dir, f'anno_id2result_{r}.pkl'), 'rb'))
+        for r in range(world_size)
+    ]
+    all_anno_id2meta = [
+        pickle.load(open(os.path.join(gather_dir, f'anno_id2meta_{r}.pkl'), 'rb'))
+        for r in range(world_size)
+    ]
+    return all_anno_id2result, all_anno_id2meta
+
+
+def save_config(output_dir, exp_configs, runtime_args, world_size):
+    """Save complete experiment configuration to output_dir for reproducibility."""
+    config_save_path = os.path.join(output_dir, "config.yaml")
+    full_config = {
+        **exp_configs,
+        'runtime_args': runtime_args,
+        'execution_info': {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'world_size': world_size,
+        }
+    }
+    with open(config_save_path, 'w') as F:
+        yaml.dump(full_config, F, default_flow_style=False, sort_keys=False)
+    print(f"Configuration saved to: {config_save_path}")
 
 
 def parse_arguments():
@@ -190,7 +247,7 @@ def find_start_sample_id(rank, cache_dir):
     filenames = os.listdir(cache_dir)
     processed_sample_ids = [-1]
     for filename in filenames:
-        sample_id = re.findall(f'anno_id2result_{rank}_(\d+).pkl', filename)
+        sample_id = re.findall(rf'anno_id2result_{rank}_(\d+)\.pkl', filename)
         if len(sample_id):
             processed_sample_ids.append(int(sample_id[0]))
     start_sample_id = max(processed_sample_ids) + 1
@@ -202,7 +259,8 @@ def main(rank, world_size, args):
         device = 'auto'
     else:
         device = f'cuda:{rank}'
-        data_parallel_setup(rank, world_size, args.timeout)
+        if world_size > 1:
+            data_parallel_setup(rank, world_size, args.timeout)
 
     exp_configs = load_yaml(args.config_path)
 
@@ -246,6 +304,8 @@ def main(rank, world_size, args):
     dataloader = DataLoader(shard_dataset, batch_size=None, num_workers=exp_configs['dataloader_num_workers'])
 
     for i, sample in tqdm(enumerate(dataloader), total=len(dataloader), desc=f'rank {rank}'): # disable=rank!=0
+        if sample is None:
+            continue
         i = i + start_sample_id
         idx, message, meta = sample
         pred_answer = client.infer(message)
@@ -260,15 +320,10 @@ def main(rank, world_size, args):
             pickle.dump(anno_id2result, open(anno_id2result_cachefile, 'wb'))
             pickle.dump(anno_id2meta, open(anno_id2meta_cachefile, 'wb'))
 
-    if not args.auto_sharding: # Gather results from all processes
-        all_anno_id2result = [None] * world_size
-        all_anno_id2meta = [None] * world_size
-        dist.barrier()
-        dist.all_gather_object(all_anno_id2result, anno_id2result)
-        dist.all_gather_object(all_anno_id2meta, anno_id2meta)
-    else:
-        all_anno_id2result = [anno_id2result]
-        all_anno_id2meta = [anno_id2meta]
+    all_anno_id2result, all_anno_id2meta = gather_results(
+        anno_id2result, anno_id2meta, rank, world_size,
+        exp_configs['output_dir'], auto_sharding=args.auto_sharding, timeout=args.timeout
+    )
 
     if rank == 0:
         # Merge results
@@ -284,6 +339,20 @@ def main(rank, world_size, args):
             json.dump(merged_anno_id2result, F)
         with open(meta_file, 'w') as F:
             json.dump(merged_anno_id2meta, F)
+        
+        # Save complete configuration for reproducibility
+        runtime_args = {
+            'model_name': args.model_name,
+            'hf_path': args.hf_path,
+            'config_path': args.config_path,
+            'video_frame_extraction_fps': args.video_frame_extraction_fps,
+            'n_gpus': args.n_gpus,
+            'auto_sharding': args.auto_sharding,
+            'enable_cache': args.enable_cache,
+            'skip_eval': args.skip_eval,
+            'timeout': args.timeout,
+        }
+        save_config(exp_configs['output_dir'], exp_configs, runtime_args, world_size)
 
         if not args.skip_eval:
             # Evaluate
@@ -297,7 +366,7 @@ def main(rank, world_size, args):
             infer_result_df.to_csv(infer_res_file, index=False)
             eval_result_df.to_csv(eval_res_file, index=True)
 
-    if not args.auto_sharding:
+    if not args.auto_sharding and world_size > 1:
         cleanup_parallel_setup()
 
 
@@ -305,6 +374,9 @@ if __name__ == "__main__":
     args = parse_arguments()
     world_size = args.n_gpus
     if args.auto_sharding: # For auto model parallel through huggingface
+        main(0, 1, args)
+    elif world_size == 1:
+        # 单卡直接在主进程跑，不走 mp.spawn，方便暴露 SIGFPE 的完整堆栈
         main(0, 1, args)
     else: # For data parallel
         mp.spawn(main, args=(world_size, args), nprocs=world_size, join=True)

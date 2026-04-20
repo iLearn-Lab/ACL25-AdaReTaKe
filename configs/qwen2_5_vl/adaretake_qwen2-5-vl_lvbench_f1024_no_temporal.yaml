@@ -14,14 +14,12 @@ longvideo_kwargs: {
     'prompt_guided_compression': True,
     'pos_embed_reforge': True,
     'max_input_length': 16000,
-    # Temporal
-    'enable_temporal_adaptation': True,
-    'temporal_adaptation_ratio': 4,
-    # Layer
+    # Temporal: disabled
+    'enable_temporal_adaptation': False,
+    # Layer: AdaKV enabled
     'budget_allocation_method': 'adakv',
   },
 }
-
 
 ### dataset
 dataset_name: lvbench
@@ -30,11 +28,11 @@ dataloader_num_workers: 4
 
 ### data
 sample_fps: 2
-max_num_frames: 2048
+max_num_frames: 1024
 longsize_resolution: 448
 
 ### generate
 do_sample: false
 
 ### output
-output_dir: results/qwen25vl_7b_lvbench_f2048_2fps_r448/adaretake-16k_reforge
+output_dir: results/qwen25vl_7b_lvbench_f1024_2fps_r448/adaretake-16k_reforge_no_temporal

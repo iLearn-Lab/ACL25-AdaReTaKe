@@ -16,7 +16,6 @@ longvideo_kwargs: {
     'max_input_length': 16000,
     # Temporal
     'enable_temporal_adaptation': True,
-    'temporal_adaptation_ratio': 4,
     # Layer
     'budget_allocation_method': 'adakv',
   },
@@ -30,11 +29,11 @@ dataloader_num_workers: 4
 
 ### data
 sample_fps: 2
-max_num_frames: 2048
+max_num_frames: 1024
 longsize_resolution: 448
 
 ### generate
 do_sample: false
 
 ### output
-output_dir: results/qwen25vl_7b_mlvu_f2048_2fps_r448/adaretake-16k
+output_dir: results/qwen25vl_7b_mlvu_f1024_2fps_r448/adaretake-16k

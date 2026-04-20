@@ -11,13 +11,9 @@ from torch.nn import CrossEntropyLoss
 import numpy as np
 
 from transformers.cache_utils import Cache
-from transformers.utils import (
-    is_flash_attn_2_available,
-    logging,
-)
+from transformers.utils import logging
 from transformers import Qwen2VLConfig
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-    Qwen2VLSdpaAttention,
     Qwen2VLCausalLMOutputWithPast,
     Qwen2VLForConditionalGeneration,
     repeat_kv,
@@ -26,13 +22,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 
 from .visual_compression import *
 from .longvideo_cache import *
-
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_varlen_func
-
-    from transformers.modeling_flash_attention_utils import _flash_attention_forward
-else:
-    flash_attn_varlen_func = None
+from .qwen2_5_vl import bisection_projection, compute_temporal_adaptation_ratios
 
 DEBUG_MODE = False
 
@@ -122,249 +112,8 @@ def retake_Qwen2VLAttention_forward(
     return attn_output, attn_weights, past_key_value
 
 
-def retake_Qwen2VLSdpaAttention_forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Cache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-    cache_position: Optional[torch.LongTensor] = None,
-    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    if output_attentions:
-        # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-        logger.warning_once(
-            "Qwen2VLModel is using Qwen2VLSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-            'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-        )
-        return super(Qwen2VLSdpaAttention, self).forward(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-        )
-
-    bsz, q_len, _ = hidden_states.size()
-
-    query_states = self.q_proj(hidden_states)
-    key_states = self.k_proj(hidden_states)
-    value_states = self.v_proj(hidden_states)
-
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
-    # Update position_ids if positional embeddings are reforged
-    if past_key_value is not None and getattr(past_key_value, "pos_embed_reforge", False):
-        prev_tempo_idx = past_key_value.get_prev_temporal_idx(self.layer_idx)
-        if prev_tempo_idx + 1 != position_ids[0,0,0]:
-            assert bsz == 1
-            # print("Discontinuous positional ids %d + 1 != %d at layer %d" % (prev_tempo_idx,  position_ids[0,0,0], self.layer_idx))
-            position_ids[0,0,:] += prev_tempo_idx + 1 - position_ids[0,0,0]
-
-    # NOTE: Compute position_ids internally to support positional id reforge from KV compression
-    cos, sin = self.rotary_emb(value_states, position_ids)
-
-    query_states, key_states = apply_multimodal_rotary_pos_emb(
-        query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
-    )
-
-    if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-        # Specific to KVCache compression methods
-        cache_kwargs.update({"query_states": query_states, "position_ids": position_ids, 
-                             "rotary_emb": self.rotary_emb, "mrope_section": self.rope_scaling["mrope_section"]})
-        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-    causal_mask = attention_mask
-    if attention_mask is not None:  # no matter the length, we just slice it
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-
-    # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-    # Reference: https://github.com/pytorch/pytorch/issues/112577.
-    if query_states.device.type == "cuda" and attention_mask is not None:
-        query_states = query_states.contiguous()
-        key_states = key_states.contiguous()
-        value_states = value_states.contiguous()
-
-    # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-    # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-    # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-    is_causal = True if causal_mask is None and q_len > 1 else False
-
-    attn_output = torch.nn.functional.scaled_dot_product_attention(
-        query_states,
-        key_states,
-        value_states,
-        attn_mask=causal_mask,
-        dropout_p=self.attention_dropout if self.training else 0.0,
-        is_causal=is_causal,
-    )
-
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-
-    attn_output = self.o_proj(attn_output)
-
-    return attn_output, None, past_key_value
-
-
-def retake_Qwen2VLFlashAttention2_forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Cache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-    cache_position: Optional[torch.LongTensor] = None,
-    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-):
-    bsz, q_len, _ = hidden_states.size()
-
-    query_states = self.q_proj(hidden_states)
-    key_states = self.k_proj(hidden_states)
-    value_states = self.v_proj(hidden_states)
-
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        if self.layer_idx is None:
-            raise ValueError(
-                f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                "with a layer index."
-            )
-        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
-    # Update position_ids if positional embeddings are reforged
-    if past_key_value is not None and getattr(past_key_value, "pos_embed_reforge", False):
-        prev_tempo_idx = past_key_value.get_prev_temporal_idx(self.layer_idx)
-        if prev_tempo_idx + 1 != position_ids[0,0,0]:
-            assert bsz == 1
-            # print("Discontinuous positional ids %d + 1 != %d at layer %d" % (prev_tempo_idx,  position_ids[0,0,0], self.layer_idx))
-            position_ids[0,0,:] += prev_tempo_idx + 1 - position_ids[0,0,0]
-
-    # NOTE: Compute position_ids internally to support positional id reforge from KV compression
-    cos, sin = self.rotary_emb(value_states, position_ids)
-
-    query_states, key_states = apply_multimodal_rotary_pos_emb(
-        query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
-    )
-
-    if past_key_value is not None:
-        # Activate slicing cache only if the config has a value `sliding_windows` attribute
-        cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
-        if (
-            self.config.use_sliding_window
-            and getattr(self.config, "sliding_window", None) is not None
-            and kv_seq_len > self.config.sliding_window
-            and cache_has_contents
-        ):
-            slicing_tokens = 1 - self.config.sliding_window
-
-            past_key = past_key_value[self.layer_idx][0]
-            past_value = past_key_value[self.layer_idx][1]
-
-            past_key = past_key[:, :, slicing_tokens:, :].contiguous()
-            past_value = past_value[:, :, slicing_tokens:, :].contiguous()
-
-            if past_key.shape[-2] != self.config.sliding_window - 1:
-                raise ValueError(
-                    f"past key must have a shape of (`batch_size, num_heads, self.config.sliding_window-1, head_dim`), got"
-                    f" {past_key.shape}"
-                )
-
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, slicing_tokens:]
-                attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
-
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-        # Specific to KVCache compression methods
-        cache_kwargs.update({"query_states": query_states, "position_ids": position_ids, 
-                             "rotary_emb": self.rotary_emb, "mrope_section": self.rope_scaling["mrope_section"]})
-        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-    # repeat k/v heads if n_kv_heads < n_heads
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
-    dropout_rate = 0.0 if not self.training else self.attention_dropout
-
-    # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-    # therefore the input hidden states gets silently casted in float32. Hence, we need
-    # cast them back in float16 just to be sure everything works as expected.
-    input_dtype = query_states.dtype
-    if input_dtype == torch.float32:
-        if torch.is_autocast_enabled():
-            target_dtype = torch.get_autocast_gpu_dtype()
-        # Handle the case where the model is quantized
-        elif hasattr(self.config, "_pre_quantization_dtype"):
-            target_dtype = self.config._pre_quantization_dtype
-        else:
-            target_dtype = self.q_proj.weight.dtype
-
-        logger.warning_once(
-            f"The input hidden states seems to be silently casted in float32, this might be related to"
-            f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-            f" {target_dtype}."
-        )
-
-        query_states = query_states.to(target_dtype)
-        key_states = key_states.to(target_dtype)
-        value_states = value_states.to(target_dtype)
-
-    # Reashape to the expected shape for Flash Attention
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
-
-    if (
-        self.config.use_sliding_window
-        and getattr(self.config, "sliding_window", None) is not None
-        and self.layer_idx >= self.config.max_window_layers
-    ):
-        sliding_window = self.config.sliding_window
-    else:
-        sliding_window = None
-
-    attn_output = _flash_attention_forward(
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        q_len,
-        dropout=dropout_rate,
-        sliding_window=sliding_window,
-        is_causal=self.is_causal,
-        use_top_left_mask=self._flash_attn_uses_top_left_mask,
-    )
-
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
-    attn_output = self.o_proj(attn_output)
-
-    if not output_attentions:
-        attn_weights = None
-
-    return attn_output, attn_weights, past_key_value
-
-
 def retake_Qwen2VLForConditionalGeneration_compress_video_tokens(
-    self, 
+    self,
     input_ids: torch.LongTensor = None,
     attention_mask: torch.Tensor = None,
     video_embeds: torch.Tensor = None,
@@ -591,10 +340,14 @@ def retake_Qwen2VLForConditionalGeneration_forward(
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
     if inputs_embeds is None:
+        # Helper: transformers 4.57 的 visual encoder 返回 BaseModelOutputWithPooling 而非纯 tensor
+        def _extract_embeds(output):
+            return output.last_hidden_state if hasattr(output, 'last_hidden_state') else output
+
         # Extract visual features
         if pixel_values is not None:
             pixel_values = pixel_values.type(self.visual.get_dtype())
-            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+            image_embeds = _extract_embeds(self.visual(pixel_values, grid_thw=image_grid_thw))
 
         if pixel_values_videos is not None:
             pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
@@ -603,7 +356,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
             # chunk_size can be up to 128 or higher if you have flash attention
             frame_chunk_size = getattr(self.config, 'longvideo_kwargs', {}).get('frame_chunk_size', 1000000000)
             if grid_t < frame_chunk_size:
-                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                video_embeds = _extract_embeds(self.visual(pixel_values_videos, grid_thw=video_grid_thw))
             else:
                 d = pixel_values_videos.shape[-1]
                 pixel_values_videos = pixel_values_videos.reshape(grid_t, grid_h*grid_w, d)
@@ -614,7 +367,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
                     video_grid_thw_chunk = video_grid_thw.clone()
                     video_grid_thw_chunk[0,0] = grid_t_chunk
                     video_embeds.append(
-                        self.visual(pixel_values_videos_chunk.reshape(-1, d), grid_thw=video_grid_thw_chunk)
+                        _extract_embeds(self.visual(pixel_values_videos_chunk.reshape(-1, d), grid_thw=video_grid_thw_chunk))
                     )
                 video_embeds = torch.cat(video_embeds)
             # Compression video tokens
@@ -672,6 +425,13 @@ def retake_Qwen2VLForConditionalGeneration_forward(
     if is_prefill and chunk_size is not None: # Chunked prefill stage
         assert past_key_values is not None
         kvcache_compression = getattr(past_key_values, 'kvcache_compression', False)
+
+        # Pre-compute per-chunk temporal adaptation ratios (AdaReTaKe Eq. 9)
+        if kvcache_compression:
+            chunk_compression_ratios = compute_temporal_adaptation_ratios(
+                self.config, inputs_embeds, modality_segments, video_grid_thw, chunk_size
+            )
+
         for seg_id, (s, e, dtype) in enumerate(modality_segments):
             if dtype == 'text': # Prefill text without kvcache_compression
                 past_key_values.kvcache_compression = False
@@ -700,7 +460,10 @@ def retake_Qwen2VLForConditionalGeneration_forward(
                         ss, ee, modality_segments, cache_position, position_ids, attention_mask, past_key_values, inputs_embeds
                     )
                     if hasattr(past_key_values, 'before_forward'):
-                        past_key_values.before_forward(prompt_length=prompt_length)
+                        past_key_values.before_forward(prompt_length=prompt_length, position_ids=position_ids_chunk)
+                    # Pass pre-computed temporal adaptation ratio for this chunk
+                    if kvcache_compression and hasattr(past_key_values, 'set_temporal_adaptation_ratio'):
+                        past_key_values.set_temporal_adaptation_ratio(chunk_compression_ratios[idx])
                     outputs = self.model(
                         input_ids=None,
                         position_ids=position_ids_chunk,

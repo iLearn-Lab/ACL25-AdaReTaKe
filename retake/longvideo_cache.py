@@ -677,8 +677,14 @@ class StandardVidLangKVCache(VidLangKVCache):
                 self.position_cache[layer_idx] = torch.cat(
                     [self.position_cache[layer_idx], position_ids_key], dim=-1
                 )
-        else: # when prefilling textual tokens or decoding / kvcache compression disabled
-            assert getattr(self, 'prompt_length', None) is None
+        else: # when prefilling textual tokens or decoding / kvcache compression disabled / compression_ratio >= 1.0
+            # NOTE: prompt_length 可能非 None——当 temporal adaptation 使 compression_ratio >= 1.0 时，
+            # 视频 chunk 也会走这个分支（跳过压缩），此时不应 assert。
+            # 只在非 video prefill 场景（prompt_length is None）时处理 text scores 和 position cache。
+            if getattr(self, 'prompt_length', None) is not None:
+                # 视频 chunk 但无需压缩（ratio >= 1.0），直接更新 position cache 后返回
+                _ = self.update_position_ids(position_ids, layer_idx)
+                return key_states_output, value_states_output
             # In transformers >= 4.57, the text model splits position_ids and passes a 2D
             # text_position_ids to decoder layers.  Expand to 3D so that position_cache stays
             # consistent with the 3D tensors written during video chunk prefill.

@@ -283,7 +283,7 @@ def compute_temporal_adaptation_ratios(config, inputs_embeds, modality_segments,
         num_video_tokens = e - s
         num_chunks = math.ceil(num_video_tokens / chunk_size)
 
-        if not enable_temporal_adaptation:
+        if base_ratio == 1.0 or not enable_temporal_adaptation:
             # 均匀分配，每个 chunk 直接用 base_ratio
             return [base_ratio] * num_chunks
 
@@ -335,26 +335,6 @@ def compute_temporal_adaptation_ratios(config, inputs_embeds, modality_segments,
             )
         else:
             chunk_compression_ratios = [base_ratio] * num_chunks
-
-        # # ── 诊断日志：收集 temporal adaptation 分布数据 ──
-        # # 输出到 /tmp/temporal_ratios_log.jsonl，每行一个样本
-        # _log_path = os.environ.get('TEMPORAL_RATIO_LOG', '')
-        # if _log_path:
-        #     import json as _json
-        #     try:
-        #         _entry = {
-        #             'base_ratio': float(base_ratio),
-        #             'num_chunks': num_chunks,
-        #             'mean_distance': float(mean_distance),
-        #             'chunk_distances': chunk_distances,
-        #             'chunk_ratios': chunk_compression_ratios,
-        #             'min_ratio': min(chunk_compression_ratios),
-        #             'max_ratio': max(chunk_compression_ratios),
-        #         }
-        #         with open(_log_path, 'a') as _f:
-        #             _f.write(_json.dumps(_entry) + '\n')
-        #     except Exception:
-        #         pass  # 静默失败，不影响推理
 
         return chunk_compression_ratios
 

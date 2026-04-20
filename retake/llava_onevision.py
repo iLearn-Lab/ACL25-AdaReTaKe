@@ -32,6 +32,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 
 from .visual_compression import *
 from .longvideo_cache import *
+from .qwen2_5_vl import bisection_projection
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
@@ -276,6 +277,78 @@ def retake_LlavaOnevisionForConditionalGeneration_compress_video_tokens(
     return input_ids, attention_mask, selected_video_feature, position_ids, cache_position, tgt_grid_t, keypatches_mask
 
 
+def compute_temporal_adaptation_ratios_llava(config, inputs_embeds, modality_segments, chunk_size, pool_stride):
+    """计算每个 chunk 的时序自适应压缩比（AdaReTaKe Eq. 9），LLaVA-OneVision 版本。
+
+    与 Qwen2.5-VL 版本的区别：LLaVA 没有 video_grid_thw，帧数从 video segment token 数量推算。
+    每帧的 patch 数 = (H/patch_size/pool_stride) * (W/patch_size/pool_stride) + 1 (newline token)。
+
+    Returns:
+        chunk_compression_ratios: List[float]，长度等于 num_chunks。
+    """
+    assert getattr(config, 'longvideo_kwargs', None) and config.longvideo_kwargs.get('kvcache_compression', False)
+    compression_kwargs = config.longvideo_kwargs['kvcache_compression_kwargs']
+    base_ratio = compression_kwargs['compression_ratio']
+    enable_temporal_adaptation = compression_kwargs.get('enable_temporal_adaptation', False)
+
+    for seg_id, (s, e, dtype) in enumerate(modality_segments):
+        if dtype != 'video':
+            continue
+
+        num_video_tokens = e - s
+        num_chunks = math.ceil(num_video_tokens / chunk_size)
+
+        if base_ratio == 1.0 or not enable_temporal_adaptation:
+            return [base_ratio] * num_chunks
+
+        video_segment_embeds = inputs_embeds[0, s:e]  # [num_video_tokens, hidden_dim]
+
+        # LLaVA-OneVision: each frame produces H*W patches + 1 newline token after pooling
+        height = width = config.vision_config.image_size // config.vision_config.patch_size
+        patches_per_frame = math.ceil(height / pool_stride) * math.ceil(width / pool_stride) + 1  # +1 for newline
+        num_frames = num_video_tokens // patches_per_frame
+
+        if num_frames <= 1:
+            return [base_ratio] * num_chunks
+
+        frame_embeds = video_segment_embeds[:num_frames * patches_per_frame].reshape(
+            num_frames, patches_per_frame, -1
+        )
+        # 对空间维度取均值
+        frame_embeds = frame_embeds.mean(dim=1)  # [num_frames, dim]
+
+        # 按 chunk 划分帧
+        frames_per_chunk = num_frames / num_chunks
+        chunk_embeds = []
+        for idx in range(num_chunks):
+            fs = int(idx * frames_per_chunk)
+            fe = min(int((idx + 1) * frames_per_chunk), num_frames)
+            chunk_embeds.append(frame_embeds[fs:fe].mean(dim=0))
+        chunk_embeds = torch.stack(chunk_embeds)
+
+        # 边界 padding + cosine distance
+        padded = torch.cat([chunk_embeds[:1], chunk_embeds, chunk_embeds[-1:]], dim=0)
+        center = padded[1:-1]
+        left   = padded[:-2]
+        right  = padded[2:]
+        dist_left  = 1 - F.cosine_similarity(center, left,  dim=-1)
+        dist_right = 1 - F.cosine_similarity(center, right, dim=-1)
+        chunk_distances = ((dist_left + dist_right) / 2).tolist()
+
+        mean_distance = sum(chunk_distances) / num_chunks
+        if mean_distance > 0:
+            raw_ratios = [base_ratio * d / mean_distance for d in chunk_distances]
+            chunk_compression_ratios = bisection_projection(
+                raw_ratios, w_min=1e-3, w_max=1.0, target_sum=base_ratio * num_chunks,
+            )
+        else:
+            chunk_compression_ratios = [base_ratio] * num_chunks
+
+        return chunk_compression_ratios
+
+    return None
+
+
 def retake_LlavaOnevisionForConditionalGeneration_forge_input_chunks(
     self, 
     ss, 
@@ -497,6 +570,13 @@ def retake_LlavaOnevisionForConditionalGeneration_forward(
     if is_prefill and chunk_size is not None: # Chunked prefill stage
         assert past_key_values is not None
         kvcache_compression = getattr(past_key_values, 'kvcache_compression', False)
+
+        # Pre-compute per-chunk temporal adaptation ratios (AdaReTaKe Eq. 9)
+        if kvcache_compression:
+            chunk_compression_ratios = compute_temporal_adaptation_ratios_llava(
+                self.config, inputs_embeds, modality_segments, chunk_size, self.pool_stride
+            )
+
         for seg_id, (s, e, dtype) in enumerate(modality_segments):
             if dtype == 'text': # Prefill text without kvcache_compression
                 past_key_values.kvcache_compression = False
@@ -525,7 +605,10 @@ def retake_LlavaOnevisionForConditionalGeneration_forward(
                         ss, ee, modality_segments, position_ids, cache_position, attention_mask, past_key_values, inputs_embeds
                     )
                     if hasattr(past_key_values, 'before_forward'):
-                        past_key_values.before_forward(prompt_length=prompt_length)
+                        past_key_values.before_forward(prompt_length=prompt_length, position_ids=position_ids_chunk)
+                    # Pass pre-computed temporal adaptation ratio for this chunk
+                    if kvcache_compression and hasattr(past_key_values, 'set_temporal_adaptation_ratio'):
+                        past_key_values.set_temporal_adaptation_ratio(chunk_compression_ratios[idx])
                     outputs = self.language_model(
                         attention_mask=attention_mask_chunk,
                         position_ids=position_ids_chunk,

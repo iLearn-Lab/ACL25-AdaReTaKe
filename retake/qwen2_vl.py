@@ -22,6 +22,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 
 from .visual_compression import *
 from .longvideo_cache import *
+from .qwen2_5_vl import bisection_projection, compute_temporal_adaptation_ratios
 
 DEBUG_MODE = False
 
@@ -424,6 +425,13 @@ def retake_Qwen2VLForConditionalGeneration_forward(
     if is_prefill and chunk_size is not None: # Chunked prefill stage
         assert past_key_values is not None
         kvcache_compression = getattr(past_key_values, 'kvcache_compression', False)
+
+        # Pre-compute per-chunk temporal adaptation ratios (AdaReTaKe Eq. 9)
+        if kvcache_compression:
+            chunk_compression_ratios = compute_temporal_adaptation_ratios(
+                self.config, inputs_embeds, modality_segments, video_grid_thw, chunk_size
+            )
+
         for seg_id, (s, e, dtype) in enumerate(modality_segments):
             if dtype == 'text': # Prefill text without kvcache_compression
                 past_key_values.kvcache_compression = False
@@ -452,7 +460,10 @@ def retake_Qwen2VLForConditionalGeneration_forward(
                         ss, ee, modality_segments, cache_position, position_ids, attention_mask, past_key_values, inputs_embeds
                     )
                     if hasattr(past_key_values, 'before_forward'):
-                        past_key_values.before_forward(prompt_length=prompt_length)
+                        past_key_values.before_forward(prompt_length=prompt_length, position_ids=position_ids_chunk)
+                    # Pass pre-computed temporal adaptation ratio for this chunk
+                    if kvcache_compression and hasattr(past_key_values, 'set_temporal_adaptation_ratio'):
+                        past_key_values.set_temporal_adaptation_ratio(chunk_compression_ratios[idx])
                     outputs = self.model(
                         input_ids=None,
                         position_ids=position_ids_chunk,

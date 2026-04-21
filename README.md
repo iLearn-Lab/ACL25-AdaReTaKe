@@ -40,17 +40,6 @@ Read AGENTS.md and reproduce the AdaReTaKe paper results end-to-end.
 
 ---
 
-## 📜 Release Note  
-The current open-source version is an **early research release** capable of reproducing leaderboard results.  
-
-🔒 **Full version status**: Undergoing internal review (commercial considerations)  
-🔄 **Post-approval**: Complete code will be released for **research purposes only**  
-
-📝 **[Request Access via Google Form](https://docs.google.com/forms/d/e/1FAIpQLSf4l6fFTJgiRawMngOBo36NpZDgpHdQuOnbUaPFObnQfZ_FRg/viewform?usp=dialog)**  
-*We appreciate your interest and patience!*  
-
----
-
 ## 🎯 Key Contributions  
 | Feature | Innovation |
 |---------|------------|
